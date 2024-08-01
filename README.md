@@ -10,9 +10,3 @@
 - **Modern UI**: Built with Jetpack Compose for an intuitive and responsive user interface.
 - **Dynamic Permissions**: Handles runtime permissions for Bluetooth, Wi-Fi, and location services, adapting to different Android versions.
 - **Transfer Progress**: Monitor file transfer progress and speed for both BLE and Wi-Fi connections.
-
-## Installation
-
-1. **Clone the repository**:
-   ```bash
-   git clone https://github.com/Prashant-Android/NearbyShare-BLE.git
