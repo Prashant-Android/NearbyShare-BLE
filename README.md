@@ -1,11 +1,12 @@
-This is a Kotlin Multiplatform project targeting Android, Desktop.
+# NearbyShare-BLE
 
-* `/composeApp` is for code that will be shared across your Compose Multiplatform applications.
-  It contains several subfolders:
-  - `commonMain` is for code that’s common for all targets.
-  - Other folders are for Kotlin code that will be compiled for only the platform indicated in the folder name.
-    For example, if you want to use Apple’s CoreCrypto for the iOS part of your Kotlin app,
-    `iosMain` would be the right folder for such calls.
+**NearbyShare-BLE** is an Android application designed for efficient file transfer between devices using Bluetooth Low Energy (BLE) and Wi-Fi. Leveraging the Nearby Connections API, it enables seamless file sharing with a focus on simplicity and reliability.
 
+## Features
 
-Learn more about [Kotlin Multiplatform](https://www.jetbrains.com/help/kotlin-multiplatform-dev/get-started.html)…
+- **File Transfer**: Send and receive files via Bluetooth Low Energy (BLE) or Wi-Fi.
+- **Device Discovery**: Scan for and discover nearby devices that support file sharing.
+- **Connection Management**: Initiate, accept, and manage connections with other devices.
+- **Modern UI**: Built with Jetpack Compose for an intuitive and responsive user interface.
+- **Dynamic Permissions**: Handles runtime permissions for Bluetooth, Wi-Fi, and location services, adapting to different Android versions.
+- **Transfer Progress**: Monitor file transfer progress and speed for both BLE and Wi-Fi connections.
