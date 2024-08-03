@@ -49,6 +49,12 @@ import java.util.Locale
 
 class MainActivity : ComponentActivity() {
 
+    private lateinit var connectionsClient: ConnectionsClient
+    private var isAdvertisingCluster by mutableStateOf(false)
+    private var isAdvertisingStar by mutableStateOf(false)
+    private var isDiscoveringCluster by mutableStateOf(false)
+    private var isDiscoveringStar by mutableStateOf(false)
+
     private var isSenderUser by mutableStateOf(false)
     private var isReceiverUser by mutableStateOf(false)
 
@@ -63,7 +69,6 @@ class MainActivity : ComponentActivity() {
     private var receivedFileName: String? = null
     private var receivedFileSize: Long = 0
 
-    private lateinit var connectionsClient: ConnectionsClient
     private var selectedFileUri: Uri? by mutableStateOf(null)
     private var selectedEndpointId: String? by mutableStateOf(null)
 
@@ -96,15 +101,34 @@ class MainActivity : ComponentActivity() {
         connectionsClient = Nearby.getConnectionsClient(this)
 
         setContent {
-            FileShareApp(isAdvertising = isAdvertising,
-                isDiscovering = isDiscovering,
+            FileShareApp(
+                isAdvertising = isAdvertisingCluster || isAdvertisingStar,
+                isDiscovering = isDiscoveringCluster || isDiscoveringStar,
                 discoveredEndpoints = discoveredEndpoints,
                 connectionInfoText = connectionInfoText,
                 isDeviceConnected = isDeviceConnected,
                 selectedFileUri = selectedFileUri,
                 isConnecting = isConnecting,
-                onStartAdvertising = { startAdvertising() },
-                onStartDiscovering = { startDiscovering() },
+                onStartAdvertising = { strategy ->
+                    when (strategy) {
+                        SelectedStrategy.P2P_CLUSTER -> startAdvertising(Strategy.P2P_CLUSTER)
+                        SelectedStrategy.P2P_STAR -> startAdvertising(Strategy.P2P_STAR)
+                        SelectedStrategy.BOTH -> {
+                            startAdvertising(Strategy.P2P_CLUSTER)
+                            startAdvertising(Strategy.P2P_STAR)
+                        }
+                    }
+                },
+                onStartDiscovering = { strategy ->
+                    when (strategy) {
+                        SelectedStrategy.P2P_CLUSTER -> startDiscovering(Strategy.P2P_CLUSTER)
+                        SelectedStrategy.P2P_STAR -> startDiscovering(Strategy.P2P_STAR)
+                        SelectedStrategy.BOTH -> {
+                            startDiscovering(Strategy.P2P_CLUSTER)
+                            startDiscovering(Strategy.P2P_STAR)
+                        }
+                    }
+                },
                 onStopAll = { stopAllEndpoints() },
                 onEndpointSelected = { endpointId ->
                     selectedEndpointId = endpointId
@@ -117,10 +141,6 @@ class MainActivity : ComponentActivity() {
                 onSendFile = {
                     selectedFileUri?.let { uri ->
                         selectedEndpointId?.let { endpointId ->
-                            isReceivingFile = false
-                            showFileTransferDialog = true
-                            fileName = getOriginalFileName(uri)
-                            fileSize = contentResolver.openFileDescriptor(uri, "r")?.statSize ?: 0L
                             handleFileTransfer()
                         }
                     }
@@ -130,8 +150,8 @@ class MainActivity : ComponentActivity() {
                         addCategory(Intent.CATEGORY_OPENABLE)
                         type = "*/*"
                     })
-                })
-
+                }
+            )
             if (showFileTransferDialog) {
                 FileTransferDialog(
                     isReceiving = isReceivingFile,
@@ -148,8 +168,7 @@ class MainActivity : ComponentActivity() {
         }
 
         requestPermissions()
-    }
-    private var isTransferCancelled = false
+    }    private var isTransferCancelled = false
     private var currentTransferJob: Job? = null
 
     private fun cancelFileTransfer() {
@@ -265,35 +284,50 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-    private fun startAdvertising() {
-        val advertisingOptions =
-            AdvertisingOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
+
+
+    private fun startAdvertising(strategy: Strategy) {
+        Log.d("FileShare", "Starting advertising with strategy: $strategy")
+        val advertisingOptions = AdvertisingOptions.Builder().setStrategy(strategy).build()
 
         connectionsClient.startAdvertising(
             getDeviceNameString(), SERVICE_ID, connectionLifecycleCallback, advertisingOptions
         ).addOnSuccessListener {
-            isAdvertising = true
+            when (strategy) {
+                Strategy.P2P_CLUSTER -> isAdvertisingCluster = true
+                Strategy.P2P_STAR -> isAdvertisingStar = true
+            }
+            isAdvertising = isAdvertisingCluster || isAdvertisingStar
+            Log.d("FileShare", "Advertising started successfully with strategy: $strategy")
         }.addOnFailureListener {
-            isAdvertising = false
-            Log.e("FileShare", "Advertising failed", it)
+            Log.e("FileShare", "Advertising failed with strategy: $strategy", it)
         }
     }
 
-    private fun startDiscovering() {
-        val discoveryOptions = DiscoveryOptions.Builder().setStrategy(Strategy.P2P_CLUSTER).build()
+    private fun startDiscovering(strategy: Strategy) {
+        Log.d("FileShare", "Starting discovering with strategy: $strategy")
+        val discoveryOptions = DiscoveryOptions.Builder().setStrategy(strategy).build()
 
         connectionsClient.startDiscovery(
             SERVICE_ID, endpointDiscoveryCallback, discoveryOptions
         ).addOnSuccessListener {
-            isDiscovering = true
+            when (strategy) {
+                Strategy.P2P_CLUSTER -> isDiscoveringCluster = true
+                Strategy.P2P_STAR -> isDiscoveringStar = true
+            }
+            isDiscovering = isDiscoveringCluster || isDiscoveringStar
+            Log.d("FileShare", "Discovery started successfully with strategy: $strategy")
         }.addOnFailureListener {
-            isDiscovering = false
-            Log.e("FileShare", "Discovery failed", it)
+            Log.e("FileShare", "Discovery failed with strategy: $strategy", it)
         }
     }
 
     private fun stopAllEndpoints() {
         connectionsClient.stopAllEndpoints()
+        isAdvertisingCluster = false
+        isAdvertisingStar = false
+        isDiscoveringCluster = false
+        isDiscoveringStar = false
         isAdvertising = false
         isDiscovering = false
         discoveredEndpoints = emptyList()
@@ -301,6 +335,8 @@ class MainActivity : ComponentActivity() {
 
     private fun stopDiscovering() {
         connectionsClient.stopDiscovery()
+        isDiscoveringCluster = false
+        isDiscoveringStar = false
         isDiscovering = false
     }
 

@@ -28,11 +28,18 @@ import androidx.compose.material.Text
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
+import com.google.android.gms.nearby.connection.Strategy
+
+enum class SelectedStrategy { P2P_CLUSTER, P2P_STAR, BOTH }
 
 @Composable
 fun FileShareApp(
@@ -43,13 +50,15 @@ fun FileShareApp(
     isDeviceConnected: Boolean,
     selectedFileUri: Uri?,
     isConnecting: Boolean,
-    onStartAdvertising: () -> Unit,
-    onStartDiscovering: () -> Unit,
+    onStartAdvertising: (SelectedStrategy) -> Unit,
+    onStartDiscovering: (SelectedStrategy) -> Unit,
     onStopAll: () -> Unit,
     onEndpointSelected: (String) -> Unit,
     onSendFile: () -> Unit,
     onPickFile: () -> Unit
 ) {
+    var selectedStrategy by remember { mutableStateOf(SelectedStrategy.P2P_CLUSTER) }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -76,21 +85,8 @@ fun FileShareApp(
                 } else if (isConnecting) {
                     Text("Connecting...", color = Color.Blue, style = MaterialTheme.typography.body2)
                 }
+                Text("Current Strategy: $selectedStrategy", style = MaterialTheme.typography.body2)
             }
-        }
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        Box(
-            modifier = Modifier
-                .size(250.dp)
-                .background(Color(0xFFFFFFFF), shape = CircleShape)
-        ) {
-            Image(
-                painter = painterResource(id = R.drawable.images), // Replace with your drawable resource ID
-                contentDescription = "Share",
-                modifier = Modifier.size(180.dp).align(Alignment.Center),
-            )
         }
 
         Spacer(modifier = Modifier.height(24.dp))
@@ -100,18 +96,57 @@ fun FileShareApp(
             horizontalArrangement = Arrangement.SpaceEvenly
         ) {
             Button(
-                onClick = if (isAdvertising) onStopAll else onStartAdvertising,
+                onClick = { selectedStrategy = SelectedStrategy.P2P_CLUSTER },
+                colors = ButtonDefaults.buttonColors(
+                    backgroundColor = if (selectedStrategy == SelectedStrategy.P2P_CLUSTER) Color.Green else Color.Gray
+                )
+            ) {
+                Text("P2P_CLUSTER", color = Color.White)
+            }
+            Button(
+                onClick = { selectedStrategy = SelectedStrategy.P2P_STAR },
+                colors = ButtonDefaults.buttonColors(
+                    backgroundColor = if (selectedStrategy == SelectedStrategy.P2P_STAR) Color.Green else Color.Gray
+                )
+            ) {
+                Text("P2P_STAR", color = Color.White)
+            }
+            Button(
+                onClick = { selectedStrategy = SelectedStrategy.BOTH },
+                colors = ButtonDefaults.buttonColors(
+                    backgroundColor = if (selectedStrategy == SelectedStrategy.BOTH) Color.Green else Color.Gray
+                )
+            ) {
+                Text("BOTH", color = Color.White)
+            }
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceEvenly
+        ) {
+            Button(
+                onClick = {
+                    if (isAdvertising) onStopAll()
+                    else onStartAdvertising(selectedStrategy)
+                },
                 colors = ButtonDefaults.buttonColors(backgroundColor = if (isAdvertising) Color.Red else Color(0xFF1976D2))
             ) {
                 Text(if (isAdvertising) "Stop Advertising" else "Advertise", color = Color.White)
             }
             Button(
-                onClick = if (isDiscovering) onStopAll else onStartDiscovering,
+                onClick = {
+                    if (isDiscovering) onStopAll()
+                    else onStartDiscovering(selectedStrategy)
+                },
                 colors = ButtonDefaults.buttonColors(backgroundColor = if (isDiscovering) Color.Red else Color(0xFF1976D2))
             ) {
                 Text(if (isDiscovering) "Stop Discovering" else "Discover", color = Color.White)
             }
         }
+
 
         Spacer(modifier = Modifier.height(16.dp))
 
@@ -159,7 +194,5 @@ fun FileShareApp(
         }
 
         Spacer(modifier = Modifier.height(16.dp))
-
-
     }
 }
