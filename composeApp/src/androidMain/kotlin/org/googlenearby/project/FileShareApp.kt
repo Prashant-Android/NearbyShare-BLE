@@ -42,11 +42,7 @@ fun FileShareApp(
     connectionInfoText: String,
     isDeviceConnected: Boolean,
     selectedFileUri: Uri?,
-    wifiTransferSpeed: String,
-    bluetoothTransferSpeed: String,
     isConnecting: Boolean,
-    fileTransferProgress: Float,
-    transferSpeed: String,
     onStartAdvertising: () -> Unit,
     onStartDiscovering: () -> Unit,
     onStopAll: () -> Unit,
@@ -132,15 +128,6 @@ fun FileShareApp(
             }
         }
 
-        if (fileTransferProgress > 0f) {
-            Spacer(modifier = Modifier.height(16.dp))
-            LinearProgressIndicator(
-                progress = fileTransferProgress,
-                modifier = Modifier.fillMaxWidth()
-            )
-            Text("Transfer Speed: $transferSpeed", style = MaterialTheme.typography.caption)
-        }
-
         Spacer(modifier = Modifier.height(16.dp))
 
         if (discoveredEndpoints.isNotEmpty()) {
@@ -173,12 +160,6 @@ fun FileShareApp(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Text("WiFi: $wifiTransferSpeed", style = MaterialTheme.typography.caption)
-            Text("Bluetooth: $bluetoothTransferSpeed", style = MaterialTheme.typography.caption)
-        }
+
     }
 }
