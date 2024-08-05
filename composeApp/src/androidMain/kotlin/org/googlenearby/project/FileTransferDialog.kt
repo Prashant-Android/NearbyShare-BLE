@@ -36,17 +36,12 @@ fun FileTransferDialog(
         confirmButton = {
             Row {
 
-                if (isTransferComplete) {
+                if (isTransferComplete && ! isReceiving) {
                     TextButton(onClick = onOpenFile) {
                         Text("Open File Location")
                     }
                 }
 
-                if (!isReceiving) {
-                    TextButton(onClick = onOpenFile) {
-                        Text("Cancel")
-                    }
-                }
             }
         }
     )
