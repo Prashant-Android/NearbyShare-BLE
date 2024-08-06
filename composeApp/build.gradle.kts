@@ -26,6 +26,8 @@ kotlin {
             implementation(compose.preview)
             implementation(libs.androidx.activity.compose)
             implementation("androidx.core:core-ktx:1.13.1")
+            implementation("androidx.compose.material3:material3:1.2.1")
+
             implementation("androidx.fragment:fragment:1.3.0")
             implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.0")
             implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.0")

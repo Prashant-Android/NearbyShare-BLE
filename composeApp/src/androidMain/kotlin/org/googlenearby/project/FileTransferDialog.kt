@@ -11,6 +11,7 @@ import androidx.compose.ui.unit.dp
 
 @Composable
 fun FileTransferDialog(
+    latency: Double,
     isReceiving: Boolean,
     fileName: String,
     fileSize: Long,
@@ -22,7 +23,11 @@ fun FileTransferDialog(
     onOpenFile: () -> Unit
 ) {
     AlertDialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = {
+            if (isTransferComplete) {
+                onDismiss()
+            }
+        },
         title = { Text(if (isReceiving) "Receiving" else "Transferring") },
         text = {
             Column {
@@ -31,17 +36,28 @@ fun FileTransferDialog(
                 LinearProgressIndicator(progress = progress)
                 Text("Progress: ${(progress * 100).toInt()}%")
                 Text("Speed: $speed")
+                Text("Latency: $latency")
             }
         },
         confirmButton = {
             Row {
-
-                if (isTransferComplete && ! isReceiving) {
-                    TextButton(onClick = onOpenFile) {
-                        Text("Open File Location")
+                if (isTransferComplete) {
+                    if (!isReceiving) {
+                        TextButton(onClick = onOpenFile) {
+                            Text("Open File Location")
+                        }
+                    }
+                    TextButton(onClick = onDismiss) {
+                        Text("Close")
                     }
                 }
-
+            }
+        },
+        dismissButton = {
+            if (!isTransferComplete) {
+                TextButton(onClick = onCancel) {
+                    Text("Cancel")
+                }
             }
         }
     )

@@ -19,7 +19,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.core.content.FileProvider
+import androidx.lifecycle.lifecycleScope
 import com.google.android.gms.nearby.Nearby
 import com.google.android.gms.nearby.connection.AdvertisingOptions
 import com.google.android.gms.nearby.connection.ConnectionInfo
@@ -33,23 +33,22 @@ import com.google.android.gms.nearby.connection.Payload
 import com.google.android.gms.nearby.connection.PayloadCallback
 import com.google.android.gms.nearby.connection.PayloadTransferUpdate
 import com.google.android.gms.nearby.connection.Strategy
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import org.json.JSONException
 import org.json.JSONObject
 import java.io.File
 import java.io.FileNotFoundException
 import java.io.FileOutputStream
-import java.io.IOException
 import java.nio.charset.Charset
 import java.util.Locale
 
-
 class MainActivity : ComponentActivity() {
 
+
     private lateinit var connectionsClient: ConnectionsClient
+    private var latency by mutableStateOf(0.0)
     private var isAdvertisingCluster by mutableStateOf(false)
     private var isAdvertisingStar by mutableStateOf(false)
     private var isDiscoveringCluster by mutableStateOf(false)
@@ -101,6 +100,7 @@ class MainActivity : ComponentActivity() {
         connectionsClient = Nearby.getConnectionsClient(this)
 
         setContent {
+
             FileShareApp(
                 isAdvertising = isAdvertisingCluster || isAdvertisingStar,
                 isDiscovering = isDiscoveringCluster || isDiscoveringStar,
@@ -109,6 +109,7 @@ class MainActivity : ComponentActivity() {
                 isDeviceConnected = isDeviceConnected,
                 selectedFileUri = selectedFileUri,
                 isConnecting = isConnecting,
+                latency = latency,
                 onStartAdvertising = { strategy ->
                     when (strategy) {
                         SelectedStrategy.P2P_CLUSTER -> startAdvertising(Strategy.P2P_CLUSTER)
@@ -150,10 +151,11 @@ class MainActivity : ComponentActivity() {
                         addCategory(Intent.CATEGORY_OPENABLE)
                         type = "*/*"
                     })
-                }
+                },
             )
+
             if (showFileTransferDialog) {
-                FileTransferDialog(
+                FileTransferDialog(latency = latency,
                     isReceiving = isReceivingFile,
                     fileName = fileName,
                     fileSize = fileSize,
@@ -162,24 +164,27 @@ class MainActivity : ComponentActivity() {
                     isTransferComplete = isTransferComplete,
                     onDismiss = { showFileTransferDialog = false },
                     onCancel = { cancelFileTransfer() },
-                    onOpenFile = { openDownloadsFolder() }
-                )
+                    onOpenFile = { openDownloadsFolder() })
             }
         }
 
         requestPermissions()
-    }    private var isTransferCancelled = false
+    }
+
     private var currentTransferJob: Job? = null
 
     private fun cancelFileTransfer() {
-        isTransferCancelled = true
         currentTransferJob?.cancel()
     }
+
 
     private fun openDownloadsFolder() {
         try {
             // Get the Downloads directory
-            val downloadsUri = Uri.parse(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).toString())
+            val downloadsUri = Uri.parse(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                    .toString()
+            )
 
             // Create an intent to view the Downloads folder
             val intent = Intent(Intent.ACTION_VIEW).apply {
@@ -191,10 +196,13 @@ class MainActivity : ComponentActivity() {
             if (intent.resolveActivity(packageManager) != null) {
                 startActivity(intent)
             } else {
-                Toast.makeText(this, "No app found to open the Downloads folder", Toast.LENGTH_SHORT).show()
+                Toast.makeText(
+                    this, "No app found to open the Downloads folder", Toast.LENGTH_SHORT
+                ).show()
             }
         } catch (e: Exception) {
-            Toast.makeText(this, "Error opening Downloads folder: ${e.message}", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Error opening Downloads folder: ${e.message}", Toast.LENGTH_LONG)
+                .show()
             Log.e("FileShare", "Error opening Downloads folder", e)
         }
     }
@@ -285,7 +293,6 @@ class MainActivity : ComponentActivity() {
         }
 
 
-
     private fun startAdvertising(strategy: Strategy) {
         Log.d("FileShare", "Starting advertising with strategy: $strategy")
         val advertisingOptions = AdvertisingOptions.Builder().setStrategy(strategy).build()
@@ -363,6 +370,38 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private var latencyResponseCallback: ((Long) -> Unit)? = null
+
+
+    private fun measureLatency(endpointId: String) {
+        val startTime = System.nanoTime()
+        val payload = Payload.fromBytes("LATENCY_TEST".toByteArray(Charset.forName("UTF-8")))
+
+        connectionsClient.sendPayload(endpointId, payload).addOnSuccessListener {
+            latencyResponseCallback = { responseTime ->
+                val latency = (System.nanoTime() - startTime) / 1_000_000.0 // Convert nanoseconds to milliseconds
+                this.latency = (this.latency + latency) / 2 // Moving average
+                runOnUiThread {
+                    // Update latency on UI
+                    Log.d("Latency", "Measured latency: $latency ms")
+                }
+            }
+        }.addOnFailureListener { e ->
+            Log.e("Latency", "Failed to send latency test payload", e)
+        }
+    }
+
+
+    private fun startLatencyMeasurement(endpointId: String) {
+        lifecycleScope.launch {
+            while (isDeviceConnected) {
+                measureLatency(endpointId)
+                delay(1000) // Reduce delay to update more frequently
+            }
+        }
+    }
+
+
     private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
         override fun onConnectionInitiated(endpointId: String, info: ConnectionInfo) {
             connectionsClient.acceptConnection(endpointId, payloadCallback)
@@ -376,18 +415,21 @@ class MainActivity : ComponentActivity() {
                     Toast.LENGTH_SHORT
                 ).show()
             }
+            startLatencyMeasurement(endpointId) // Start measuring latency
         }
 
         override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
             if (result.status.isSuccess) {
                 connectionInfoText = "Connected to $endpointId"
                 isDeviceConnected = true
-                selectedEndpointId = endpointId  // Set the selected endpoint
+                selectedEndpointId = endpointId
                 runOnUiThread {
                     Toast.makeText(
                         this@MainActivity, "Device connected successfully", Toast.LENGTH_SHORT
                     ).show()
                 }
+
+                startLatencyMeasurement(endpointId)
             } else {
                 connectionInfoText = "Connection failed with $endpointId"
                 isDeviceConnected = false
@@ -421,7 +463,6 @@ class MainActivity : ComponentActivity() {
     // Method to send file
     private fun sendFile(endpointId: String, uri: Uri) {
         try {
-
             isReceiverUser = false
             isSenderUser = true
 
@@ -465,6 +506,7 @@ class MainActivity : ComponentActivity() {
                     }
                     lastUpdateTime = currentTime
                 }
+
             }
 
             // Send an empty payload to signify the end of the file
@@ -487,9 +529,6 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
-
-
-
 
     private fun calculateTransferSpeed(bytesTransferred: Long): String {
         val currentTime = System.currentTimeMillis()
@@ -521,23 +560,31 @@ class MainActivity : ComponentActivity() {
         private var lastUpdateTime = 0L
 
         override fun onPayloadReceived(endpointId: String, payload: Payload) {
-
             isReceiverUser = true
             isSenderUser = false
 
             when (payload.type) {
                 Payload.Type.BYTES -> {
                     val bytes = payload.asBytes() ?: return
-                    if (!receivingFile) {
-                        handleMetadata(bytes)
-                    } else {
-                        if (bytes.isEmpty()) {
-                            finishFileReception()
-                        } else {
-                            writeChunkToFile(bytes)
+                    val receivedMessage = String(bytes, Charset.forName("UTF-8"))
+
+                    when {
+                        receivedMessage == "LATENCY_TEST" -> {
+                            // Immediately send back the latency test payload
+                            connectionsClient.sendPayload(endpointId, payload)
+                            if (!isSenderUser) {
+                                // If we're not the sender, invoke the latency callback
+                                latencyResponseCallback?.invoke(System.nanoTime())
+                                latencyResponseCallback = null
+                            }
                         }
+
+                        !receivingFile -> handleMetadata(bytes)
+                        bytes.isEmpty() -> finishFileReception()
+                        else -> writeChunkToFile(bytes)
                     }
                 }
+
                 else -> Log.w("FileShare", "Unhandled payload type: ${payload.type}")
             }
         }
@@ -550,7 +597,8 @@ class MainActivity : ComponentActivity() {
                 receivedFileSize = metadata.getLong("fileSize")
                 Log.d("FileShare", "Received metadata: $receivedFileName, size: $receivedFileSize")
 
-                val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                val downloadsDir =
+                    Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
                 val file = File(downloadsDir, receivedFileName ?: "unknown_file")
                 outputStream = FileOutputStream(file)
                 receivingFile = true
@@ -588,7 +636,8 @@ class MainActivity : ComponentActivity() {
             outputStream = null
             receivingFile = false
 
-            val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            val downloadsDir =
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
             val file = File(downloadsDir, receivedFileName ?: "unknown_file")
             Log.d("FileShare", "File received: ${file.name}, size: ${file.length()}")
 
@@ -597,9 +646,7 @@ class MainActivity : ComponentActivity() {
             }
 
             MediaScannerConnection.scanFile(
-                this@MainActivity,
-                arrayOf(file.toString()),
-                null
+                this@MainActivity, arrayOf(file.toString()), null
             ) { path, uri ->
                 Log.i("FileShare", "Scanned $path: -> uri=$uri")
             }
@@ -625,7 +672,5 @@ class MainActivity : ComponentActivity() {
             // This method is less relevant now as we're handling progress in writeChunkToFile
         }
     }
-
 }
 
-data class Endpoint(val id: String, val name: String)
