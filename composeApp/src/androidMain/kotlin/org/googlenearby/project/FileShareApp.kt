@@ -2,6 +2,7 @@ package org.googlenearby.project
 
 import android.net.Uri
 import android.net.wifi.p2p.WifiP2pDevice
+import android.text.format.Formatter
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
@@ -15,6 +16,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 
 enum class SelectedStrategy { P2P_CLUSTER, P2P_STAR, BOTH }
@@ -37,6 +39,14 @@ fun FileShareApp(
     onEndpointSelected: (String) -> Unit,
     onSendFile: () -> Unit,
     onPickFile: () -> Unit,
+    wifiDirectPeers: List<WifiP2pDevice>,
+    wifiDirectConnectionStatus: String,
+    isWifiDirectConnected: Boolean,
+    connectedWifiDirectDevices: List<WifiP2pDevice>,
+    onStartWifiDirectDiscovery: () -> Unit,
+    onConnectWifiDirectPeer: (WifiP2pDevice) -> Unit,
+    onDisconnectWifiDirect: () -> Unit,
+    onSendFileWifiDirect: (WifiP2pDevice, Uri) -> Unit,
 ) {
     var selectedStrategy by remember { mutableStateOf(SelectedStrategy.P2P_CLUSTER) }
 
@@ -98,11 +108,123 @@ fun FileShareApp(
                 )
 
                 Spacer(modifier = Modifier.height(16.dp))
+
+                WiFiDirectManagerSection(
+                    peers = wifiDirectPeers,
+                    connectionStatus = wifiDirectConnectionStatus,
+                    isConnected = isWifiDirectConnected,
+                    connectedDevices = connectedWifiDirectDevices,
+                    onStartDiscovery = onStartWifiDirectDiscovery,
+                    onConnectPeer = onConnectWifiDirectPeer,
+                    onDisconnect = onDisconnectWifiDirect,
+                    onSendFile = onSendFileWifiDirect,
+                    selectedFileUri = selectedFileUri,
+                    onPickFile = onPickFile  // Add this line
+                )
+
             }
         }
     }
 }
 
+@Composable
+fun WiFiDirectManagerSection(
+    peers: List<WifiP2pDevice>,
+    connectionStatus: String,
+    isConnected: Boolean,
+    connectedDevices: List<WifiP2pDevice>,
+    onStartDiscovery: () -> Unit,
+    onConnectPeer: (WifiP2pDevice) -> Unit,
+    onDisconnect: () -> Unit,
+    onSendFile: (WifiP2pDevice, Uri) -> Unit,
+    selectedFileUri: Uri?,
+    onPickFile: () -> Unit
+) {
+    ElevatedCard(
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text("Wi-Fi Direct", style = MaterialTheme.typography.titleMedium)
+            Text("Status: $connectionStatus", style = MaterialTheme.typography.bodyMedium)
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            if (!isConnected) {
+                Button(
+                    onClick = onStartDiscovery,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Start Wi-Fi Direct Discovery")
+                }
+
+                if (peers.isNotEmpty()) {
+                    Text("Discovered Peers:", style = MaterialTheme.typography.titleSmall)
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(150.dp)
+                    ) {
+                        items(peers) { peer ->
+                            ElevatedCard(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 4.dp)
+                                    .clickable { onConnectPeer(peer) }
+                            ) {
+                                Text(
+                                    peer.deviceName,
+                                    modifier = Modifier.padding(8.dp),
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                            }
+                        }
+                    }
+                } else {
+                    Text("No peers discovered", style = MaterialTheme.typography.bodyMedium)
+                }
+            } else {
+                Text("Connected Devices:", style = MaterialTheme.typography.titleSmall)
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(150.dp)
+                ) {
+                    items(connectedDevices) { device ->
+                        ElevatedCard(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp)
+                        ) {
+                            Column(modifier = Modifier.padding(8.dp)) {
+                                Text(
+                                    device.deviceName,
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Button(onClick = onPickFile) {
+                                    Text("Select File")
+                                }
+                                if (selectedFileUri != null) {
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Button(onClick = { onSendFile(device, selectedFileUri) }) {
+                                        Text("Send File")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Button(
+                    onClick = onDisconnect,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Disconnect")
+                }
+            }
+        }
+    }
+}
 @Composable
 fun ConnectionInfoCard(
     connectionInfoText: String,
@@ -289,4 +411,34 @@ fun StrategySelector(
             )
         }
     }
+}
+@Composable
+fun FileReceiveDialog(
+    fileName: String,
+    fileSize: Long,
+    senderName: String,
+    onAccept: () -> Unit,
+    onReject: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = { /* Do nothing, force user to make a choice */ },
+        title = { Text("Incoming File") },
+        text = {
+            Column {
+                Text("$senderName wants to send you a file:")
+                Text("File Name: $fileName")
+                Text("File Size: ${Formatter.formatShortFileSize(LocalContext.current, fileSize)}")
+            }
+        },
+        confirmButton = {
+            Button(onClick = onAccept) {
+                Text("Accept")
+            }
+        },
+        dismissButton = {
+            Button(onClick = onReject) {
+                Text("Reject")
+            }
+        }
+    )
 }
