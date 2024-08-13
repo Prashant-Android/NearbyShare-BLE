@@ -1,15 +1,25 @@
 package org.googlenearby.project
 
 import android.Manifest
+import android.annotation.SuppressLint
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.media.MediaScannerConnection
+import android.net.NetworkInfo
 import android.net.Uri
+import android.net.wifi.WifiManager
+import android.net.wifi.WpsInfo
+import android.net.wifi.p2p.WifiP2pConfig
+import android.net.wifi.p2p.WifiP2pDevice
+import android.net.wifi.p2p.WifiP2pDeviceList
+import android.net.wifi.p2p.WifiP2pManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.OpenableColumns
 import android.util.Log
-import android.webkit.MimeTypeMap
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -19,45 +29,50 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.core.content.FileProvider
 import com.google.android.gms.nearby.Nearby
-import com.google.android.gms.nearby.connection.AdvertisingOptions
-import com.google.android.gms.nearby.connection.ConnectionInfo
-import com.google.android.gms.nearby.connection.ConnectionLifecycleCallback
-import com.google.android.gms.nearby.connection.ConnectionResolution
-import com.google.android.gms.nearby.connection.ConnectionsClient
-import com.google.android.gms.nearby.connection.DiscoveredEndpointInfo
-import com.google.android.gms.nearby.connection.DiscoveryOptions
-import com.google.android.gms.nearby.connection.EndpointDiscoveryCallback
-import com.google.android.gms.nearby.connection.Payload
-import com.google.android.gms.nearby.connection.PayloadCallback
-import com.google.android.gms.nearby.connection.PayloadTransferUpdate
-import com.google.android.gms.nearby.connection.Strategy
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withContext
-import org.json.JSONException
+import com.google.android.gms.nearby.connection.*
 import org.json.JSONObject
 import java.io.File
 import java.io.FileNotFoundException
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.ServerSocket
+import java.net.Socket
+import java.net.SocketException
+import java.net.SocketTimeoutException
 import java.nio.charset.Charset
-import java.util.Locale
+import kotlin.concurrent.thread
 
 
-class MainActivity : ComponentActivity() {
+class MainActivity : ComponentActivity(), WifiP2pManager.ChannelListener {
+
+    private var connectionState by mutableStateOf(ConnectionState.IDLE)
+
+    enum class ConnectionState {
+        IDLE, CONNECTING, CONNECTED, DISCONNECTING
+    }
+
+
+    private var serverSocket: ServerSocket? = null
+    private var isServerSocketOpen = false
+    private val MAX_RETRIES = 5
+    private val RETRY_INTERVAL = 2000L // 2 seconds
+    private val SOCKET_TIMEOUT = 30000 // 30 seconds
+    private var isConnecting = false
 
     private lateinit var connectionsClient: ConnectionsClient
-    private var isAdvertisingCluster by mutableStateOf(false)
-    private var isAdvertisingStar by mutableStateOf(false)
-    private var isDiscoveringCluster by mutableStateOf(false)
-    private var isDiscoveringStar by mutableStateOf(false)
+    private lateinit var wifiP2pManager: WifiP2pManager
+    private lateinit var wifiP2pChannel: WifiP2pManager.Channel
 
-    private var isSenderUser by mutableStateOf(false)
-    private var isReceiverUser by mutableStateOf(false)
-
+    private var isAdvertising by mutableStateOf(false)
+    private var isDiscovering by mutableStateOf(false)
+    private var discoveredEndpoints by mutableStateOf<List<Endpoint>>(emptyList())
+    private var connectionInfoText by mutableStateOf("Searching Devices...")
+    private var isDeviceConnected by mutableStateOf(false)
 
     private var showFileTransferDialog by mutableStateOf(false)
     private var fileTransferProgress by mutableFloatStateOf(0f)
@@ -65,93 +80,50 @@ class MainActivity : ComponentActivity() {
     private var fileName by mutableStateOf("")
     private var fileSize by mutableLongStateOf(0L)
     private var isReceivingFile by mutableStateOf(false)
-
-    private var receivedFileName: String? = null
-    private var receivedFileSize: Long = 0
+    private var isTransferComplete by mutableStateOf(false)
 
     private var selectedFileUri: Uri? by mutableStateOf(null)
     private var selectedEndpointId: String? by mutableStateOf(null)
 
-    private var isConnecting by mutableStateOf(false)
-    private var isAdvertising by mutableStateOf(false)
-    private var isDiscovering by mutableStateOf(false)
-    private var discoveredEndpoints by mutableStateOf<List<Endpoint>>(emptyList())
-    private var connectionInfoText by mutableStateOf("Searching Devices...")
-    private var isDeviceConnected by mutableStateOf(false)
-    private var isTransferComplete by mutableStateOf(false)
     private var startTime: Long = 0
 
-    companion object {
-        const val SERVICE_ID = "your-service-id"
+    private val intentFilter = IntentFilter().apply {
+        addAction(WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION)
+        addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION)
+        addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION)
+        addAction(WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION)
+    }
 
-        private fun getDeviceNameString(): String {
-            val manufacturer = Build.MANUFACTURER
-            val model = Build.MODEL
-            return if (model.startsWith(manufacturer)) {
-                model.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() }
-            } else {
-                "$manufacturer $model".replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() }
-            }
-        }
+    private val receiver = WiFiDirectBroadcastReceiver()
+
+    companion object {
+        const val SERVICE_ID = "com.example.wifidirectfileshare"
+        private const val PORT = 8888
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         connectionsClient = Nearby.getConnectionsClient(this)
+        wifiP2pManager = getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
+        wifiP2pChannel = wifiP2pManager.initialize(this, mainLooper, this)
 
         setContent {
             FileShareApp(
-                isAdvertising = isAdvertisingCluster || isAdvertisingStar,
-                isDiscovering = isDiscoveringCluster || isDiscoveringStar,
+                isAdvertising = isAdvertising,
+                isDiscovering = isDiscovering,
                 discoveredEndpoints = discoveredEndpoints,
                 connectionInfoText = connectionInfoText,
                 isDeviceConnected = isDeviceConnected,
                 selectedFileUri = selectedFileUri,
-                isConnecting = isConnecting,
-                onStartAdvertising = { strategy ->
-                    when (strategy) {
-                        SelectedStrategy.P2P_CLUSTER -> startAdvertising(Strategy.P2P_CLUSTER)
-                        SelectedStrategy.P2P_STAR -> startAdvertising(Strategy.P2P_STAR)
-                        SelectedStrategy.BOTH -> {
-                            startAdvertising(Strategy.P2P_CLUSTER)
-                            startAdvertising(Strategy.P2P_STAR)
-                        }
-                    }
-                },
-                onStartDiscovering = { strategy ->
-                    when (strategy) {
-                        SelectedStrategy.P2P_CLUSTER -> startDiscovering(Strategy.P2P_CLUSTER)
-                        SelectedStrategy.P2P_STAR -> startDiscovering(Strategy.P2P_STAR)
-                        SelectedStrategy.BOTH -> {
-                            startDiscovering(Strategy.P2P_CLUSTER)
-                            startDiscovering(Strategy.P2P_STAR)
-                        }
-                    }
-                },
+                onStartAdvertising = { startAdvertising() },
+                onStartDiscovering = { startDiscovering() },
                 onStopAll = { stopAllEndpoints() },
-                onEndpointSelected = { endpointId ->
-                    selectedEndpointId = endpointId
-                    stopDiscovering()
-                    isConnecting = true
-                    connectionsClient.requestConnection(
-                        getDeviceNameString(), endpointId, connectionLifecycleCallback
-                    )
-                },
-                onSendFile = {
-                    selectedFileUri?.let { uri ->
-                        selectedEndpointId?.let { endpointId ->
-                            handleFileTransfer()
-                        }
-                    }
-                },
-                onPickFile = {
-                    filePickerLauncher.launch(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-                        addCategory(Intent.CATEGORY_OPENABLE)
-                        type = "*/*"
-                    })
-                }
+                onEndpointSelected = { endpointId -> connectToEndpoint(endpointId) },
+                onSendFile = { handleFileTransfer() },
+                onPickFile = { pickFile() }
             )
+
             if (showFileTransferDialog) {
                 FileTransferDialog(
                     isReceiving = isReceivingFile,
@@ -168,464 +140,671 @@ class MainActivity : ComponentActivity() {
         }
 
         requestPermissions()
-    }    private var isTransferCancelled = false
-    private var currentTransferJob: Job? = null
-
-    private fun cancelFileTransfer() {
-        isTransferCancelled = true
-        currentTransferJob?.cancel()
     }
 
-    private fun openDownloadsFolder() {
-        try {
-            // Get the Downloads directory
-            val downloadsUri = Uri.parse(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).toString())
-
-            // Create an intent to view the Downloads folder
-            val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(downloadsUri, "*/*")
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-
-            // Start the activity to open the Downloads folder if there's an app that can handle the intent
-            if (intent.resolveActivity(packageManager) != null) {
-                startActivity(intent)
+    private fun updateConnectionUI(isConnected: Boolean, role: String, peerName: String?) {
+        runOnUiThread {
+            isDeviceConnected = isConnected
+            connectionInfoText = if (isConnected) {
+                "Connected as $role to ${peerName ?: "unknown device"}"
             } else {
-                Toast.makeText(this, "No app found to open the Downloads folder", Toast.LENGTH_SHORT).show()
+                "Disconnected"
             }
-        } catch (e: Exception) {
-            Toast.makeText(this, "Error opening Downloads folder: ${e.message}", Toast.LENGTH_LONG).show()
-            Log.e("FileShare", "Error opening Downloads folder", e)
         }
     }
 
+
+
+    override fun onResume() {
+        super.onResume()
+        registerReceiver(receiver, intentFilter)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        unregisterReceiver(receiver)
+    }
 
     private fun requestPermissions() {
-        val requiredPermissions = when {
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> {
-                arrayOf(
-                    Manifest.permission.BLUETOOTH_SCAN,
-                    Manifest.permission.BLUETOOTH_ADVERTISE,
-                    Manifest.permission.BLUETOOTH_CONNECT,
-                    Manifest.permission.ACCESS_WIFI_STATE,
-                    Manifest.permission.CHANGE_WIFI_STATE,
-                    Manifest.permission.NEARBY_WIFI_DEVICES,
-                    Manifest.permission.ACCESS_FINE_LOCATION,
-                    // Scoped storage permissions
-                    Manifest.permission.READ_EXTERNAL_STORAGE, // Scoped storage read access
-                    Manifest.permission.WRITE_EXTERNAL_STORAGE // Write access is limited, use Scoped Storage APIs
-                )
-            }
-
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
-                arrayOf(
-                    Manifest.permission.BLUETOOTH_SCAN,
-                    Manifest.permission.BLUETOOTH_ADVERTISE,
-                    Manifest.permission.BLUETOOTH_CONNECT,
-                    Manifest.permission.ACCESS_WIFI_STATE,
-                    Manifest.permission.CHANGE_WIFI_STATE,
-                    Manifest.permission.NEARBY_WIFI_DEVICES,
-                    Manifest.permission.ACCESS_COARSE_LOCATION,
-                    Manifest.permission.ACCESS_FINE_LOCATION,
-                    // Scoped storage permissions
-                    Manifest.permission.READ_EXTERNAL_STORAGE,
-                    Manifest.permission.WRITE_EXTERNAL_STORAGE
-                )
-            }
-
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
-                arrayOf(
-                    Manifest.permission.BLUETOOTH,
-                    Manifest.permission.BLUETOOTH_ADMIN,
-                    Manifest.permission.ACCESS_WIFI_STATE,
-                    Manifest.permission.CHANGE_WIFI_STATE,
-                    Manifest.permission.ACCESS_FINE_LOCATION,
-                    // Scoped storage permissions
-                    Manifest.permission.READ_EXTERNAL_STORAGE,
-                    Manifest.permission.WRITE_EXTERNAL_STORAGE
-                )
-            }
-
-            else -> {
-                arrayOf(
-                    Manifest.permission.BLUETOOTH,
-                    Manifest.permission.BLUETOOTH_ADMIN,
-                    Manifest.permission.ACCESS_WIFI_STATE,
-                    Manifest.permission.CHANGE_WIFI_STATE,
-                    Manifest.permission.ACCESS_FINE_LOCATION,
-                    // Storage permissions for Android 9 and below
-                    Manifest.permission.READ_EXTERNAL_STORAGE,
-                    Manifest.permission.WRITE_EXTERNAL_STORAGE
-                )
-            }
-        }
-
+        val requiredPermissions = arrayOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.READ_EXTERNAL_STORAGE,
+            Manifest.permission.WRITE_EXTERNAL_STORAGE
+        )
         requestMultiplePermissions.launch(requiredPermissions)
     }
-
 
     private val requestMultiplePermissions = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
-        val allPermissionsGranted = permissions.values.all { it }
-        if (!allPermissionsGranted) {
-            Log.e("FileShare", "ALl permission not granted !")
-
+        if (permissions.all { it.value }) {
+            // All permissions granted, proceed with initialization
+        } else {
+            Toast.makeText(this, "Required permissions not granted", Toast.LENGTH_LONG).show()
         }
     }
 
-    private val filePickerLauncher =
-        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-            if (result.resultCode == RESULT_OK) {
-                val uri: Uri? = result.data?.data
-                if (uri != null) {
-                    selectedFileUri = uri
-                }
-            }
-        }
-
-
-
-    private fun startAdvertising(strategy: Strategy) {
-        Log.d("FileShare", "Starting advertising with strategy: $strategy")
-        val advertisingOptions = AdvertisingOptions.Builder().setStrategy(strategy).build()
-
+    private fun startAdvertising() {
+        val advertisingOptions = AdvertisingOptions.Builder().setStrategy(Strategy.P2P_STAR).build()
         connectionsClient.startAdvertising(
-            getDeviceNameString(), SERVICE_ID, connectionLifecycleCallback, advertisingOptions
+            Build.MODEL, SERVICE_ID, connectionLifecycleCallback, advertisingOptions
         ).addOnSuccessListener {
-            when (strategy) {
-                Strategy.P2P_CLUSTER -> isAdvertisingCluster = true
-                Strategy.P2P_STAR -> isAdvertisingStar = true
-            }
-            isAdvertising = isAdvertisingCluster || isAdvertisingStar
-            Log.d("FileShare", "Advertising started successfully with strategy: $strategy")
-        }.addOnFailureListener {
-            Log.e("FileShare", "Advertising failed with strategy: $strategy", it)
+            isAdvertising = true
+            connectionInfoText = "Advertising for connections..."
+        }.addOnFailureListener { e ->
+            Log.e("WiFiDirect", "Advertising failed: ${e.message}")
         }
     }
 
-    private fun startDiscovering(strategy: Strategy) {
-        Log.d("FileShare", "Starting discovering with strategy: $strategy")
-        val discoveryOptions = DiscoveryOptions.Builder().setStrategy(strategy).build()
-
+    private fun startDiscovering() {
+        val discoveryOptions = DiscoveryOptions.Builder().setStrategy(Strategy.P2P_STAR).build()
         connectionsClient.startDiscovery(
             SERVICE_ID, endpointDiscoveryCallback, discoveryOptions
         ).addOnSuccessListener {
-            when (strategy) {
-                Strategy.P2P_CLUSTER -> isDiscoveringCluster = true
-                Strategy.P2P_STAR -> isDiscoveringStar = true
-            }
-            isDiscovering = isDiscoveringCluster || isDiscoveringStar
-            Log.d("FileShare", "Discovery started successfully with strategy: $strategy")
-        }.addOnFailureListener {
-            Log.e("FileShare", "Discovery failed with strategy: $strategy", it)
+            isDiscovering = true
+            connectionInfoText = "Discovering devices..."
+        }.addOnFailureListener { e ->
+            Log.e("WiFiDirect", "Discovery failed: ${e.message}")
         }
     }
 
-    private fun stopAllEndpoints() {
-        connectionsClient.stopAllEndpoints()
-        isAdvertisingCluster = false
-        isAdvertisingStar = false
-        isDiscoveringCluster = false
-        isDiscoveringStar = false
-        isAdvertising = false
-        isDiscovering = false
-        discoveredEndpoints = emptyList()
-    }
 
-    private fun stopDiscovering() {
-        connectionsClient.stopDiscovery()
-        isDiscoveringCluster = false
-        isDiscoveringStar = false
-        isDiscovering = false
-    }
-
-
-    private fun handleFileTransfer() {
-        selectedFileUri?.let { uri ->
-            selectedEndpointId?.let { endpointId ->
-                sendFile(endpointId, uri)
+    private fun connectToEndpoint(endpointId: String) {
+        when (connectionState) {
+            ConnectionState.IDLE -> {
+                connectionState = ConnectionState.CONNECTING
+                connectionsClient.requestConnection(Build.MODEL, endpointId, connectionLifecycleCallback)
+                    .addOnSuccessListener {
+                        Log.d("WiFiDirect", "Connection request successful")
+                    }
+                    .addOnFailureListener { e ->
+                        Log.e("WiFiDirect", "Connection request failed: ${e.message}")
+                        connectionState = ConnectionState.IDLE
+                        runOnUiThread {
+                            Toast.makeText(this, "Connection request failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+            }
+            ConnectionState.CONNECTING -> {
+                Log.d("WiFiDirect", "Already attempting to connect. Ignoring request.")
+            }
+            ConnectionState.CONNECTED -> {
+                Log.d("WiFiDirect", "Already connected. Ignoring request.")
+            }
+            ConnectionState.DISCONNECTING -> {
+                Log.d("WiFiDirect", "Currently disconnecting. Please wait and try again.")
             }
         }
     }
-
     private val endpointDiscoveryCallback = object : EndpointDiscoveryCallback() {
         override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
             if (!discoveredEndpoints.any { it.id == endpointId }) {
                 discoveredEndpoints = discoveredEndpoints + Endpoint(endpointId, info.endpointName)
-                connectionInfoText = "Found ${discoveredEndpoints.size} devices"
             }
         }
 
         override fun onEndpointLost(endpointId: String) {
             discoveredEndpoints = discoveredEndpoints.filterNot { it.id == endpointId }
-            connectionInfoText = "Found ${discoveredEndpoints.size} devices"
         }
     }
 
     private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
         override fun onConnectionInitiated(endpointId: String, info: ConnectionInfo) {
+            Log.d("WiFiDirect", "Connection initiated with $endpointId")
             connectionsClient.acceptConnection(endpointId, payloadCallback)
-            isDeviceConnected = true
-            isConnecting = false
-            connectionInfoText = "Connected to ${info.endpointName}"
-            runOnUiThread {
-                Toast.makeText(
-                    this@MainActivity,
-                    "Device is connected to ${info.endpointName}",
-                    Toast.LENGTH_SHORT
-                ).show()
-            }
         }
 
         override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
             if (result.status.isSuccess) {
-                connectionInfoText = "Connected to $endpointId"
+                Log.d("WiFiDirect", "Connected to $endpointId")
+                connectionState = ConnectionState.CONNECTED
                 isDeviceConnected = true
-                selectedEndpointId = endpointId  // Set the selected endpoint
-                runOnUiThread {
-                    Toast.makeText(
-                        this@MainActivity, "Device connected successfully", Toast.LENGTH_SHORT
-                    ).show()
-                }
+                selectedEndpointId = endpointId
+                connectionInfoText = "Connected to $endpointId"
+                initiateWifiDirectConnection(endpointId)
             } else {
-                connectionInfoText = "Connection failed with $endpointId"
-                isDeviceConnected = false
+                Log.e("WiFiDirect", "Connection failed: ${result.status}")
+                connectionState = ConnectionState.IDLE
+                connectionInfoText = "Connection failed: ${result.status}"
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "Connection failed: ${result.status}", Toast.LENGTH_SHORT).show()
+                }
             }
         }
 
         override fun onDisconnected(endpointId: String) {
+            Log.d("WiFiDirect", "Disconnected from $endpointId")
+            connectionState = ConnectionState.IDLE
             isDeviceConnected = false
             connectionInfoText = "Disconnected from $endpointId"
-        }
-    }
-
-    private fun sendFileMetadata(endpointId: String, uri: Uri) {
-        val originalFileName = getOriginalFileName(uri)
-        val fileSize = contentResolver.openFileDescriptor(uri, "r")?.statSize ?: 0L
-        val fileExtension = MimeTypeMap.getFileExtensionFromUrl(uri.toString()) ?: ""
-        val mimeType = contentResolver.getType(uri) ?: ""
-
-        val metadata = JSONObject().apply {
-            put("fileName", originalFileName)
-            put("fileSize", fileSize)
-            put("fileExtension", fileExtension)
-            put("mimeType", mimeType)
-        }
-
-        connectionsClient.sendPayload(
-            endpointId, Payload.fromBytes(metadata.toString().toByteArray(Charset.forName("UTF-8")))
-        )
-    }
-
-    // Method to send file
-    private fun sendFile(endpointId: String, uri: Uri) {
-        try {
-
-            isReceiverUser = false
-            isSenderUser = true
-
-            val originalFileName = getOriginalFileName(uri)
-            val fileSize = contentResolver.openFileDescriptor(uri, "r")?.statSize ?: 0L
-            Log.d("FileShare", "Sending file: $originalFileName, size: $fileSize")
-
-            sendFileMetadata(endpointId, uri)
-
-            val inputStream = contentResolver.openInputStream(uri)
-                ?: throw FileNotFoundException("File not found: $uri")
-
-            startTime = System.currentTimeMillis()
-
-            val buffer = ByteArray(65536) // 64KB buffer
-            var bytesRead: Int
-            var totalBytesSent = 0L
-            var lastUpdateTime = startTime
-
             runOnUiThread {
-                showFileTransferDialog = true
-                fileName = originalFileName
-                this.fileSize = fileSize
-                isReceivingFile = false
-                fileTransferProgress = 0f
-                fileTransferSpeed = "0 Mbps"
-            }
-
-            while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                val chunk = Payload.fromBytes(buffer.copyOf(bytesRead))
-                connectionsClient.sendPayload(endpointId, chunk)
-                totalBytesSent += bytesRead
-
-                val currentTime = System.currentTimeMillis()
-                if (currentTime - lastUpdateTime >= 1000) {
-                    val speed = calculateTransferSpeed(totalBytesSent)
-                    val progress = totalBytesSent.toFloat() / fileSize.toFloat()
-                    runOnUiThread {
-                        fileTransferProgress = progress
-                        fileTransferSpeed = speed
-                    }
-                    lastUpdateTime = currentTime
-                }
-            }
-
-            // Send an empty payload to signify the end of the file
-            connectionsClient.sendPayload(endpointId, Payload.fromBytes(ByteArray(0)))
-
-            inputStream.close()
-
-            Log.d("FileShare", "File sent completely. Total bytes sent: $totalBytesSent")
-
-            runOnUiThread {
-                isTransferComplete = true
-                fileTransferProgress = 1f
-                fileTransferSpeed = "0 Mbps" // Reset speed after completion
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-            Log.e("FileShare", "Exception during file sending", e)
-            runOnUiThread {
-                Toast.makeText(this, "Error sending file: ${e.message}", Toast.LENGTH_LONG).show()
+                Toast.makeText(this@MainActivity, "Disconnected from $endpointId", Toast.LENGTH_SHORT).show()
             }
         }
     }
-
-
-
-
-    private fun calculateTransferSpeed(bytesTransferred: Long): String {
-        val currentTime = System.currentTimeMillis()
-        val elapsedTime = (currentTime - startTime) / 1000.0 // Convert to seconds
-        val speedInBps = bytesTransferred / elapsedTime
-        val speedInMbps = speedInBps * 8 / 1_000_000 // Convert to Mbps
-        return String.format("%.2f Mbps", speedInMbps)
-    }
-
-    private fun getOriginalFileName(uri: Uri): String {
-        val cursor =
-            contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
-        cursor?.use {
-            if (it.moveToFirst()) {
-                val nameIndex = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                if (nameIndex != -1) {
-                    return it.getString(nameIndex)
-                }
-            }
-        }
-        return uri.lastPathSegment ?: "unknown_file"
-    }
-
-    // Payload callback to update file transfer progress and status
     private val payloadCallback = object : PayloadCallback() {
-        private var receivingFile = false
-        private var outputStream: FileOutputStream? = null
-        private var bytesReceived = 0L
-        private var lastUpdateTime = 0L
-
         override fun onPayloadReceived(endpointId: String, payload: Payload) {
-
-            isReceiverUser = true
-            isSenderUser = false
-
             when (payload.type) {
                 Payload.Type.BYTES -> {
-                    val bytes = payload.asBytes() ?: return
-                    if (!receivingFile) {
-                        handleMetadata(bytes)
-                    } else {
-                        if (bytes.isEmpty()) {
-                            finishFileReception()
-                        } else {
-                            writeChunkToFile(bytes)
-                        }
-                    }
-                }
-                else -> Log.w("FileShare", "Unhandled payload type: ${payload.type}")
-            }
-        }
-
-        private fun handleMetadata(metadataBytes: ByteArray) {
-            val metadataString = String(metadataBytes, Charset.forName("UTF-8"))
-            try {
-                val metadata = JSONObject(metadataString)
-                receivedFileName = metadata.getString("fileName")
-                receivedFileSize = metadata.getLong("fileSize")
-                Log.d("FileShare", "Received metadata: $receivedFileName, size: $receivedFileSize")
-
-                val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                val file = File(downloadsDir, receivedFileName ?: "unknown_file")
-                outputStream = FileOutputStream(file)
-                receivingFile = true
-                bytesReceived = 0L
-                startTime = System.currentTimeMillis()
-                lastUpdateTime = startTime
-
-                runOnUiThread {
-                    showFileTransferDialog = true
-                    fileName = receivedFileName ?: "Unknown"
-                    fileSize = receivedFileSize
-                    fileTransferProgress = 0f
-                    isTransferComplete = false
+                    val metadata = String(payload.asBytes()!!, Charset.forName("UTF-8"))
+                    val json = JSONObject(metadata)
+                    fileName = json.getString("fileName")
+                    fileSize = json.getLong("fileSize")
                     isReceivingFile = true
+                    showFileTransferDialog = true
+                    fileTransferProgress = 0f
                 }
-            } catch (e: JSONException) {
-                Log.e("FileShare", "Error parsing metadata", e)
-            }
-        }
-
-        private fun writeChunkToFile(chunk: ByteArray) {
-            outputStream?.write(chunk)
-            bytesReceived += chunk.size
-
-            val currentTime = System.currentTimeMillis()
-            if (currentTime - lastUpdateTime >= 1000) {
-                updateProgress()
-                lastUpdateTime = currentTime
-            }
-        }
-
-        private fun finishFileReception() {
-            outputStream?.flush()
-            outputStream?.close()
-            outputStream = null
-            receivingFile = false
-
-            val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-            val file = File(downloadsDir, receivedFileName ?: "unknown_file")
-            Log.d("FileShare", "File received: ${file.name}, size: ${file.length()}")
-
-            if (file.length() != receivedFileSize) {
-                Log.w("FileShare", "File size mismatch: expected $receivedFileSize, got ${file.length()}")
-            }
-
-            MediaScannerConnection.scanFile(
-                this@MainActivity,
-                arrayOf(file.toString()),
-                null
-            ) { path, uri ->
-                Log.i("FileShare", "Scanned $path: -> uri=$uri")
-            }
-
-            runOnUiThread {
-                isTransferComplete = true
-                fileTransferProgress = 1f
-                isReceivingFile = false
-                Toast.makeText(this@MainActivity, "File received: ${file.name}", Toast.LENGTH_LONG).show()
-            }
-        }
-
-        private fun updateProgress() {
-            val progress = bytesReceived.toFloat() / receivedFileSize.toFloat()
-            val speed = calculateTransferSpeed(bytesReceived)
-            runOnUiThread {
-                fileTransferProgress = progress
-                fileTransferSpeed = speed
+                Payload.Type.FILE -> {
+                    // Handle file payload
+                }
+                else -> Log.w("WiFiDirect", "Unknown payload type received")
             }
         }
 
         override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {
-            // This method is less relevant now as we're handling progress in writeChunkToFile
+            when (update.status) {
+                PayloadTransferUpdate.Status.IN_PROGRESS -> {
+                    fileTransferProgress = update.bytesTransferred.toFloat() / fileSize
+                    fileTransferSpeed = calculateTransferSpeed(update.bytesTransferred)
+                }
+                PayloadTransferUpdate.Status.SUCCESS -> {
+                    isTransferComplete = true
+                    showFileTransferDialog = false
+                    Toast.makeText(this@MainActivity, "File transfer completed", Toast.LENGTH_SHORT).show()
+                }
+                else -> Log.d("WiFiDirect", "Payload transfer status: ${update.status}")
+            }
         }
     }
 
+    private fun handleFileTransfer() {
+        if (connectionState != ConnectionState.CONNECTED) {
+            Log.e("WiFiDirect", "Cannot transfer file. Not connected to any device.")
+            runOnUiThread {
+                Toast.makeText(this, "Cannot transfer file. Not connected to any device.", Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
+
+        selectedFileUri?.let { uri ->
+            selectedEndpointId?.let { endpointId ->
+                try {
+                    val metadata = JSONObject().apply {
+                        put("fileName", getFileName(uri))
+                        put("fileSize", getFileSize(uri))
+                    }
+                    connectionsClient.sendPayload(endpointId, Payload.fromBytes(metadata.toString().toByteArray()))
+
+                    val parcelFileDescriptor = contentResolver.openFileDescriptor(uri, "r")
+                    parcelFileDescriptor?.let { pfd ->
+                        val filePayload = Payload.fromFile(pfd)
+                        connectionsClient.sendPayload(endpointId, filePayload)
+
+                        showFileTransferDialog = true
+                        isReceivingFile = false
+                        fileTransferProgress = 0f
+                        fileName = getFileName(uri)
+                        fileSize = getFileSize(uri)
+                    } ?: run {
+                        Log.e("FileTransfer", "Failed to open file: $uri")
+                        Toast.makeText(this, "Failed to open file", Toast.LENGTH_SHORT).show()
+                    }
+                } catch (e: Exception) {
+                    Log.e("FileTransfer", "Error preparing file transfer", e)
+                    Toast.makeText(this, "Error preparing file transfer: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+// You might need to update these functions if they're not already correct:
+
+    private fun getFileName(uri: Uri): String {
+        var result: String? = null
+        if (uri.scheme == "content") {
+            val cursor = contentResolver.query(uri, null, null, null, null)
+            cursor?.use {
+                if (it.moveToFirst()) {
+                    val nameIndex = it.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (nameIndex != -1) {
+                        result = it.getString(nameIndex)
+                    }
+                }
+            }
+        }
+        if (result == null) {
+            result = uri.path
+            val cut = result?.lastIndexOf('/')
+            if (cut != -1) {
+                result = result?.substring(cut!! + 1)
+            }
+        }
+        return result ?: "unknown"
+    }
+
+    private fun getFileSize(uri: Uri): Long {
+        var size: Long = 0
+        contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+            if (sizeIndex != -1 && cursor.moveToFirst()) {
+                size = cursor.getLong(sizeIndex)
+            }
+        }
+        return size
+    }
+
+    private fun calculateTransferSpeed(bytesTransferred: Long): String {
+        val currentTime = System.currentTimeMillis()
+        val elapsedTime = (currentTime - startTime) / 1000.0 // Convert to seconds
+        val speedInMbps = (bytesTransferred * 8 / 1_000_000) / elapsedTime
+        return String.format("%.2f Mbps", speedInMbps)
+    }
+
+    private fun cancelFileTransfer() {
+        // Implement cancellation logic
+    }
+
+    private fun openDownloadsFolder() {
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(Uri.parse(Environment.DIRECTORY_DOWNLOADS), "*/*")
+        }
+        startActivity(intent)
+    }
+
+    private fun pickFile() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+        }
+        startActivityForResult(intent, 1)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 1 && resultCode == RESULT_OK) {
+            data?.data?.let { uri ->
+                selectedFileUri = uri
+            }
+        }
+    }
+
+    override fun onChannelDisconnected() {
+        // Implement channel disconnection handling
+    }
+
+    inner class WiFiDirectBroadcastReceiver : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                WifiP2pManager.WIFI_P2P_STATE_CHANGED_ACTION -> {
+                    val state = intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1)
+                    when (state) {
+                        WifiP2pManager.WIFI_P2P_STATE_ENABLED -> {
+                            Log.d("WiFiDirect", "Wi-Fi P2P is enabled")
+                        }
+                        else -> {
+                            Log.e("WiFiDirect", "Wi-Fi P2P is not enabled")
+                        }
+                    }
+                }
+                WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> {
+                    Log.d("WiFiDirect", "Wi-Fi P2P peers changed")
+                    // Request available peers from the wifi p2p manager
+                    wifiP2pManager.requestPeers(wifiP2pChannel) { peerList ->
+                        val refreshedPeers = peerList.deviceList
+                        Log.d("WiFiDirect", "Number of peers: ${refreshedPeers.size}")
+                        refreshedPeers.forEach { device ->
+                            Log.d("WiFiDirect", "Peer: ${device.deviceName} (${device.deviceAddress})")
+                        }
+                        if (refreshedPeers != discoveredEndpoints) {
+                            discoveredEndpoints = refreshedPeers.map { Endpoint(it.deviceAddress, it.deviceName) }
+                        }
+                    }
+                }
+                WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION -> {
+                    Log.d("WiFiDirect", "Wi-Fi P2P connection changed")
+                    val networkInfo: NetworkInfo? = intent.getParcelableExtra(WifiP2pManager.EXTRA_NETWORK_INFO)
+                    if (networkInfo?.isConnected == true) {
+                        Log.d("WiFiDirect", "Device is connected")
+                        wifiP2pManager.requestConnectionInfo(wifiP2pChannel, connectionInfoListener)
+                    } else {
+                        Log.d("WiFiDirect", "Device is disconnected")
+                        isDeviceConnected = false
+                        connectionInfoText = "Disconnected"
+                    }
+                }
+                WifiP2pManager.WIFI_P2P_THIS_DEVICE_CHANGED_ACTION -> {
+                    Log.d("WiFiDirect", "This device's Wi-Fi P2P details changed")
+                    val device: WifiP2pDevice? = intent.getParcelableExtra(WifiP2pManager.EXTRA_WIFI_P2P_DEVICE)
+                    device?.let {
+                        Log.d("WiFiDirect", "This device: ${it.deviceName} (${it.deviceAddress})")
+                    }
+                }
+            }
+        }
+    }
+
+    private val connectionInfoListener = WifiP2pManager.ConnectionInfoListener { info ->
+        val groupOwnerAddress: String? = info.groupOwnerAddress?.hostAddress
+
+        if (groupOwnerAddress == null) {
+            Log.e("WiFiDirect", "Group owner address is null")
+            updateConnectionUI(false, "", null)
+            return@ConnectionInfoListener
+        }
+
+        Log.d("WiFiDirect", "Connection info received. Group owner: $groupOwnerAddress, Am I owner: ${info.isGroupOwner}")
+
+        if (info.groupFormed && info.isGroupOwner) {
+            // Do group owner tasks (server)
+            updateConnectionUI(true, "group owner", null)
+            startServerSocket()
+        } else if (info.groupFormed) {
+            // Do client tasks
+            updateConnectionUI(true, "client", groupOwnerAddress)
+            connectToGroupOwner(groupOwnerAddress)
+        } else {
+            Log.e("WiFiDirect", "Group not formed")
+            updateConnectionUI(false, "", null)
+        }
+
+        // Request group info to get the connected device name
+        wifiP2pManager.requestGroupInfo(wifiP2pChannel) { group ->
+            val connectedDevice = group?.clientList?.firstOrNull()
+            val deviceName = connectedDevice?.deviceName ?: "Unknown Device"
+            updateConnectionUI(info.groupFormed, if (info.isGroupOwner) "group owner" else "client", deviceName)
+        }
+    }
+    private fun startServerSocket() {
+        thread(start = true) {
+            try {
+                closeServerSocket() // Ensure any existing socket is closed
+
+                val localIpAddress = getLocalIpAddress()
+                Log.d("WiFiDirect", "Local IP Address: $localIpAddress")
+
+                serverSocket = ServerSocket(PORT, 50, InetAddress.getByName("0.0.0.0"))
+                serverSocket?.reuseAddress = true
+                serverSocket?.soTimeout = SOCKET_TIMEOUT
+                isServerSocketOpen = true
+                Log.d("WiFiDirect", "Server socket started on port $PORT")
+
+                if (isServerSocketListening()) {
+                    Log.d("WiFiDirect", "Server socket is listening on port $PORT")
+                } else {
+                    Log.e("WiFiDirect", "Server socket is not listening on port $PORT")
+                }
+
+                while (isServerSocketOpen) {
+                    try {
+                        Log.d("WiFiDirect", "Waiting for client connection...")
+                        val client = serverSocket?.accept()
+                        client?.let {
+                            Log.d("WiFiDirect", "Client connected: ${it.inetAddress.hostAddress}")
+                            // Handle client connection
+                            receiveFile(it)
+                        }
+                    } catch (e: SocketTimeoutException) {
+                        Log.d("WiFiDirect", "No client connected within timeout period. Continuing to listen.")
+                    } catch (e: IOException) {
+                        if (e is SocketException && e.message?.contains("Socket closed") == true) {
+                            Log.d("WiFiDirect", "Server socket was closed")
+                        } else {
+                            Log.e("WiFiDirect", "Error accepting client connection", e)
+                        }
+                    }
+                }
+            } catch (e: IOException) {
+                Log.e("WiFiDirect", "Error starting server socket", e)
+            } finally {
+                closeServerSocket()
+            }
+        }
+    }
+
+
+    private fun connectToGroupOwner(hostAddress: String) {
+        thread(start = true) {
+            var retries = 0
+            while (retries < MAX_RETRIES) {
+                try {
+                    Log.d("WiFiDirect", "Attempting to connect to group owner: $hostAddress:$PORT (attempt ${retries + 1})")
+                    val socket = Socket()
+                    socket.connect(InetSocketAddress(hostAddress, PORT), SOCKET_TIMEOUT)
+                    Log.d("WiFiDirect", "Connected to group owner")
+                    // Handle connection (e.g., send file)
+                    selectedFileUri?.let { uri ->
+                        sendFile(socket, uri)
+                    } ?: run {
+                        Log.e("WiFiDirect", "No file selected for sending")
+                        socket.close()
+                    }
+                    return@thread // Exit the thread if connection is successful
+                } catch (e: IOException) {
+                    Log.e("WiFiDirect", "Error connecting to group owner (attempt ${retries + 1})", e)
+                    retries++
+                    if (retries < MAX_RETRIES) {
+                        Log.d("WiFiDirect", "Retrying in $RETRY_INTERVAL ms...")
+                        Thread.sleep(RETRY_INTERVAL)
+                    }
+                }
+            }
+            Log.e("WiFiDirect", "Failed to connect to group owner after $MAX_RETRIES attempts")
+            runOnUiThread {
+                Toast.makeText(this@MainActivity, "Failed to connect to group owner", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+
+    private fun isServerSocketListening(): Boolean {
+        return try {
+            Socket("localhost", PORT).use { socket ->
+                socket.close()
+                true
+            }
+        } catch (e: IOException) {
+            false
+        }
+    }
+
+    private fun getLocalIpAddress(): String {
+        val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+        val ipAddress = wifiManager.connectionInfo.ipAddress
+        return String.format(
+            "%d.%d.%d.%d",
+            ipAddress and 0xff,
+            ipAddress shr 8 and 0xff,
+            ipAddress shr 16 and 0xff,
+            ipAddress shr 24 and 0xff
+        )
+    }
+
+    private fun initiateWifiDirectConnection(endpointId: String) {
+        wifiP2pManager.requestPeers(wifiP2pChannel) { peers: WifiP2pDeviceList ->
+            val device = peers.deviceList.find { it.deviceAddress == endpointId }
+            device?.let {
+                val config = WifiP2pConfig().apply {
+                    deviceAddress = it.deviceAddress
+                    wps.setup = WpsInfo.PBC
+                }
+                wifiP2pManager.connect(wifiP2pChannel, config, object : WifiP2pManager.ActionListener {
+                    override fun onSuccess() {
+                        Log.d("WiFiDirect", "Wi-Fi Direct connection initiated")
+                    }
+                    override fun onFailure(reason: Int) {
+                        Log.e("WiFiDirect", "Wi-Fi Direct connection failed: $reason")
+                        runOnUiThread {
+                            Toast.makeText(this@MainActivity, "Wi-Fi Direct connection failed: $reason", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                })
+            } ?: run {
+                Log.e("WiFiDirect", "Device not found in peer list")
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "Device not found in peer list", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+
+    private fun closeServerSocket() {
+        isServerSocketOpen = false
+        try {
+            serverSocket?.close()
+        } catch (e: IOException) {
+            Log.e("WiFiDirect", "Error closing server socket", e)
+        }
+        serverSocket = null
+        Log.d("WiFiDirect", "Server socket closed")
+    }
+    private fun stopAllEndpoints() {
+        when (connectionState) {
+            ConnectionState.CONNECTED, ConnectionState.CONNECTING -> {
+                connectionState = ConnectionState.DISCONNECTING
+                connectionsClient.stopAllEndpoints()
+                wifiP2pManager.cancelConnect(wifiP2pChannel, null)
+                wifiP2pManager.removeGroup(wifiP2pChannel, null)
+            }
+            else -> {
+                Log.d("WiFiDirect", "No active connection to stop.")
+            }
+        }
+        isAdvertising = false
+        isDiscovering = false
+        discoveredEndpoints = emptyList()
+        connectionInfoText = "Stopped all endpoints"
+        connectionState = ConnectionState.IDLE
+    }
+
+
+    private fun sendFile(socket: Socket, uri: Uri) {
+        try {
+            socket.use { connectedSocket ->
+                val outputStream: OutputStream = connectedSocket.getOutputStream()
+                val inputStream: InputStream = contentResolver.openInputStream(uri) ?: throw FileNotFoundException()
+
+                // Send file metadata
+                val metadata = JSONObject().apply {
+                    put("fileName", getFileName(uri))
+                    put("fileSize", getFileSize(uri))
+                }
+                outputStream.write(metadata.toString().toByteArray())
+
+                // Send file content
+                inputStream.use { input ->
+                    val buffer = ByteArray(4096)
+                    var bytesRead: Int
+                    var totalBytesRead = 0L
+                    val fileSize = getFileSize(uri)
+                    startTime = System.currentTimeMillis()
+
+                    showFileTransferDialog = true
+                    isReceivingFile = false
+                    fileName = getFileName(uri)
+                    this.fileSize = fileSize
+
+                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                        outputStream.write(buffer, 0, bytesRead)
+                        totalBytesRead += bytesRead
+                        updateFileTransferProgress(totalBytesRead, fileSize)
+                    }
+                }
+
+                isTransferComplete = true
+                showFileTransferDialog = false
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "File sent successfully", Toast.LENGTH_SHORT).show()
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("WiFiDirect", "Error sending file", e)
+            runOnUiThread {
+                Toast.makeText(this@MainActivity, "Error sending file: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+
+    private fun receiveFile(client: Socket) {
+        try {
+            client.use { socket ->
+                val inputStream: InputStream = socket.getInputStream()
+
+                // Read metadata
+                val metadataBuffer = ByteArray(1024)
+                val metadataBytesRead = inputStream.read(metadataBuffer)
+                if (metadataBytesRead <= 0) {
+                    Log.e("WiFiDirect", "No metadata received")
+                    return
+                }
+                val metadataString = String(metadataBuffer, 0, metadataBytesRead, Charset.forName("UTF-8"))
+                val metadataJson = JSONObject(metadataString)
+                val receivedFileName = metadataJson.getString("fileName")
+                val receivedFileSize = metadataJson.getLong("fileSize")
+
+                Log.d("WiFiDirect", "Receiving file: $receivedFileName, size: $receivedFileSize")
+
+                // Use the Downloads directory
+                val downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                val file = File(downloadDir, receivedFileName)
+
+                FileOutputStream(file).use { outputStream ->
+                    val buffer = ByteArray(4096)
+                    var bytesRead: Int
+                    var totalBytesRead = 0L
+                    startTime = System.currentTimeMillis()
+
+                    while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                        outputStream.write(buffer, 0, bytesRead)
+                        totalBytesRead += bytesRead
+                        updateFileTransferProgress(totalBytesRead, receivedFileSize)
+                    }
+                }
+
+                isTransferComplete = true
+                showFileTransferDialog = false
+                runOnUiThread {
+                    Toast.makeText(this@MainActivity, "File received successfully in Downloads folder", Toast.LENGTH_SHORT).show()
+                }
+
+                // Notify the system that a new file has been added to the Downloads folder
+                MediaScannerConnection.scanFile(
+                    this,
+                    arrayOf(file.toString()),
+                    null
+                ) { path, uri ->
+                    Log.i("WiFiDirect", "Scanned $path:")
+                    Log.i("WiFiDirect", "-> uri=$uri")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("WiFiDirect", "Error receiving file", e)
+            runOnUiThread {
+                Toast.makeText(this@MainActivity, "Error receiving file: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+
+    private fun updateFileTransferProgress(bytesTransferred: Long, totalBytes: Long) {
+        val progress = bytesTransferred.toFloat() / totalBytes.toFloat()
+        val speed = calculateTransferSpeed(bytesTransferred)
+        runOnUiThread {
+            fileTransferProgress = progress
+            fileTransferSpeed = speed
+        }
+    }
+
+
+
+
+    override fun onDestroy() {
+        super.onDestroy()
+        closeServerSocket()
+        connectionsClient.stopAllEndpoints()
+        wifiP2pManager.cancelConnect(wifiP2pChannel, null)
+        wifiP2pManager.removeGroup(wifiP2pChannel, null)
+    }
 }
 
 data class Endpoint(val id: String, val name: String)
