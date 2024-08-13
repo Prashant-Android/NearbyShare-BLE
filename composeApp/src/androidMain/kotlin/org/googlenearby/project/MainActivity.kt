@@ -24,6 +24,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.material.MaterialTheme
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -51,6 +52,8 @@ import kotlin.concurrent.thread
 class MainActivity : ComponentActivity(), WifiP2pManager.ChannelListener {
 
     private var connectionState by mutableStateOf(ConnectionState.IDLE)
+
+    private var selectedStrategy by mutableStateOf(SelectedStrategy.P2P_CLUSTER)
 
     enum class ConnectionState {
         IDLE, CONNECTING, CONNECTED, DISCONNECTING
@@ -108,37 +111,41 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ChannelListener {
         wifiP2pManager = getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
         wifiP2pChannel = wifiP2pManager.initialize(this, mainLooper, this)
 
-        setContent {
-            FileShareApp(
-                isAdvertising = isAdvertising,
-                isDiscovering = isDiscovering,
-                discoveredEndpoints = discoveredEndpoints,
-                connectionInfoText = connectionInfoText,
-                isDeviceConnected = isDeviceConnected,
-                selectedFileUri = selectedFileUri,
-                onStartAdvertising = { startAdvertising() },
-                onStartDiscovering = { startDiscovering() },
-                onStopAll = { stopAllEndpoints() },
-                onEndpointSelected = { endpointId -> connectToEndpoint(endpointId) },
-                onSendFile = { handleFileTransfer() },
-                onPickFile = { pickFile() }
-            )
 
-            if (showFileTransferDialog) {
-                FileTransferDialog(
-                    isReceiving = isReceivingFile,
-                    fileName = fileName,
-                    fileSize = fileSize,
-                    progress = fileTransferProgress,
-                    speed = fileTransferSpeed,
-                    isTransferComplete = isTransferComplete,
-                    onDismiss = { showFileTransferDialog = false },
-                    onCancel = { cancelFileTransfer() },
-                    onOpenFile = { openDownloadsFolder() }
+        setContent {
+            MaterialTheme {
+                FileShareApp(
+                    isAdvertising = isAdvertising,
+                    isDiscovering = isDiscovering,
+                    discoveredEndpoints = discoveredEndpoints,
+                    connectionInfoText = connectionInfoText,
+                    isDeviceConnected = isDeviceConnected,
+                    selectedFileUri = selectedFileUri,
+                    selectedStrategy = selectedStrategy,
+                    onStrategySelected = { strategy -> selectedStrategy = strategy },
+                    onStartAdvertising = { startAdvertising() },
+                    onStartDiscovering = { startDiscovering() },
+                    onStopAll = { stopAllEndpoints() },
+                    onEndpointSelected = { endpointId -> connectToEndpoint(endpointId) },
+                    onSendFile = { handleFileTransfer() },
+                    onPickFile = { pickFile() }
                 )
+
+                if (showFileTransferDialog) {
+                    FileTransferDialog(
+                        isReceiving = isReceivingFile,
+                        fileName = fileName,
+                        fileSize = fileSize,
+                        progress = fileTransferProgress,
+                        speed = fileTransferSpeed,
+                        isTransferComplete = isTransferComplete,
+                        onDismiss = { showFileTransferDialog = false },
+                        onCancel = { cancelFileTransfer() },
+                        onOpenFile = { openDownloadsFolder() }
+                    )
+                }
             }
         }
-
         requestPermissions()
     }
 
@@ -688,7 +695,9 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ChannelListener {
                     put("fileName", getFileName(uri))
                     put("fileSize", getFileSize(uri))
                 }
-                outputStream.write(metadata.toString().toByteArray())
+                val metadataBytes = metadata.toString().toByteArray()
+                outputStream.write(metadataBytes.size)
+                outputStream.write(metadataBytes)
 
                 // Send file content
                 inputStream.use { input ->
@@ -710,15 +719,22 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ChannelListener {
                     }
                 }
 
-                isTransferComplete = true
-                showFileTransferDialog = false
-                runOnUiThread {
-                    Toast.makeText(this@MainActivity, "File sent successfully", Toast.LENGTH_SHORT).show()
+                // Wait for confirmation from receiver
+                val confirmation = connectedSocket.getInputStream().read()
+                if (confirmation == 1) {
+                    isTransferComplete = true
+                    runOnUiThread {
+                        showFileTransferDialog = false
+                        Toast.makeText(this@MainActivity, "File sent successfully", Toast.LENGTH_SHORT).show()
+                    }
+                } else {
+                    throw IOException("File transfer failed")
                 }
             }
         } catch (e: Exception) {
             Log.e("WiFiDirect", "Error sending file", e)
             runOnUiThread {
+                showFileTransferDialog = false
                 Toast.makeText(this@MainActivity, "Error sending file: ${e.message}", Toast.LENGTH_LONG).show()
             }
         }
@@ -731,13 +747,10 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ChannelListener {
                 val inputStream: InputStream = socket.getInputStream()
 
                 // Read metadata
-                val metadataBuffer = ByteArray(1024)
-                val metadataBytesRead = inputStream.read(metadataBuffer)
-                if (metadataBytesRead <= 0) {
-                    Log.e("WiFiDirect", "No metadata received")
-                    return
-                }
-                val metadataString = String(metadataBuffer, 0, metadataBytesRead, Charset.forName("UTF-8"))
+                val metadataSize = inputStream.read()
+                val metadataBuffer = ByteArray(metadataSize)
+                inputStream.read(metadataBuffer)
+                val metadataString = String(metadataBuffer, Charset.forName("UTF-8"))
                 val metadataJson = JSONObject(metadataString)
                 val receivedFileName = metadataJson.getString("fileName")
                 val receivedFileSize = metadataJson.getLong("fileSize")
@@ -750,20 +763,29 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ChannelListener {
 
                 FileOutputStream(file).use { outputStream ->
                     val buffer = ByteArray(4096)
-                    var bytesRead: Int
+                    var bytesRead: Int =0
                     var totalBytesRead = 0L
                     startTime = System.currentTimeMillis()
 
-                    while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                    showFileTransferDialog = true
+                    isReceivingFile = true
+                    fileName = receivedFileName
+                    fileSize = receivedFileSize
+
+                    while (totalBytesRead < receivedFileSize &&
+                        inputStream.read(buffer).also { bytesRead = it } != -1) {
                         outputStream.write(buffer, 0, bytesRead)
                         totalBytesRead += bytesRead
                         updateFileTransferProgress(totalBytesRead, receivedFileSize)
                     }
                 }
 
+                // Send confirmation to sender
+                socket.getOutputStream().write(1)
+
                 isTransferComplete = true
-                showFileTransferDialog = false
                 runOnUiThread {
+                    showFileTransferDialog = false
                     Toast.makeText(this@MainActivity, "File received successfully in Downloads folder", Toast.LENGTH_SHORT).show()
                 }
 
@@ -780,11 +802,11 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ChannelListener {
         } catch (e: Exception) {
             Log.e("WiFiDirect", "Error receiving file", e)
             runOnUiThread {
+                showFileTransferDialog = false
                 Toast.makeText(this@MainActivity, "Error receiving file: ${e.message}", Toast.LENGTH_LONG).show()
             }
         }
     }
-
 
     private fun updateFileTransferProgress(bytesTransferred: Long, totalBytes: Long) {
         val progress = bytesTransferred.toFloat() / totalBytes.toFloat()
@@ -794,7 +816,6 @@ class MainActivity : ComponentActivity(), WifiP2pManager.ChannelListener {
             fileTransferSpeed = speed
         }
     }
-
 
 
 

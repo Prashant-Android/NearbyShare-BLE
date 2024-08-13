@@ -47,7 +47,7 @@ fun FileTransferDialog(
     )
 }
 
-private fun formatFileSize(size: Long): String {
+ fun formatFileSize(size: Long): String {
     val kb = size / 1024.0
     val mb = kb / 1024.0
     val gb = mb / 1024.0
